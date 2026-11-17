@@ -34,6 +34,9 @@ services:
       PROBE_TIMEOUT: "1.5"
       REQUEST_TIMEOUT: "15"
       DRAIN_DEFAULT_TIMEOUT: "30"
+      VERIFY_TIMEOUT: "1.5"
+      VERIFY_RETRY_INTERVAL: "0.5"
+      VERIFY_UNKNOWN_GRACE: "2.0"
     ports:
       - "18080:8000"
     depends_on:

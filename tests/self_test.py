@@ -15,6 +15,14 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求排空
+  15. 未知节点 404
+  16. 读超时请求不再计入 inflight，但进入“待核”；探测成功不抹去待核，
+      上游报告完成后才给出可停机回执；其他健康节点继续接流
+  17. 待核期间上游不可达 -> 维持待核；上游恢复后可继续确认并给出回执
+  18. 上游重启后旧请求经观察窗口确认不再执行
+  19. 调用方先放弃等待时，请求按网关自身超时结算并进入待核，
+      不得给出可停机回执（任务取消路径由 state_test 覆盖）
 """
 from __future__ import annotations
 
@@ -414,6 +422,249 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+
+        # 16. 网关读超时 -> 在途归零但登记待核；探测成功不抹去待核；
+        #     上游确认完成后才给可停机回执；期间其他健康节点继续接流。
+        print("== 16. 读超时进入待核，确认后才可停机 ==")
+        kill(gw)
+        procs.remove(gw)
+        # 短请求超时：/slow?seconds=6 会在 1s 时被网关放弃，上游仍继续执行
+        verify_env = dict(gw_env)
+        verify_env["REQUEST_TIMEOUT"] = "1"
+        verify_env["VERIFY_RETRY_INTERVAL"] = "0.2"
+        # 缩短“上游从未登记”的观察窗口，让上游重启场景可在测试时长内确认
+        verify_env["VERIFY_UNKNOWN_GRACE"] = "0.5"
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, verify_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        deadline = time.time() + 8
+        while time.time() < deadline and not (
+            node_status("node1")["eligible"] and node_status("node2")["eligible"]
+        ):
+            time.sleep(0.2)
+        check("重启后两节点均可接流",
+              node_status("node1")["eligible"] and node_status("node2")["eligible"])
+
+        set_mode(U1_PORT, "healthy")
+        # 先排空 node2，把慢请求固定到 node1
+        status, _, body16 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5"
+        )
+        assert status == 200, body16
+
+        result16 = {}
+
+        def slow_call16():
+            result16["status"], _, result16["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=6", timeout=15
+            )
+
+        t16 = threading.Thread(target=slow_call16)
+        t16.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.1)
+        check("慢请求已进入 node1", node_status("node1")["inflight"] == 1)
+        t16.join(timeout=15)
+        check("网关在 1s 读超时后返回 504", result16.get("status") == 504, str(result16))
+        body16 = json.loads(result16["body"])
+        check("504 响应声明请求未被确认结束",
+              body16.get("unconfirmed") is True and body16.get("request_id"), str(body16))
+
+        st = node_status("node1")
+        check("超时后网关在途数归零", st["inflight"] == 0, str(st))
+        check("超时请求进入待核", st["unconfirmed"] == 1, str(st))
+        check("待核时不得给出可停机回执", st["safe_to_stop"] is False, str(st))
+
+        # 探测持续成功，但上游仍在执行该慢请求 -> 必须保持待核
+        for _ in range(3):
+            http("POST", f"http://127.0.0.1:{GW_PORT}/admin/probe")
+            time.sleep(0.4)
+        st = node_status("node1")
+        check("多轮探测成功后待核仍在", st["unconfirmed"] == 1 and st["healthy"] is True, str(st))
+        check("探测成功不抹去待核状态", st["drain_verified"] is False, str(st))
+
+        status, _, body16 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=1"
+        )
+        b16 = json.loads(body16)
+        check("上游仍在执行时排空超时返回 202", status == 202, body16)
+        check("未确认时 drained/safe_to_stop 均为 false",
+              b16.get("drained") is False and b16.get("safe_to_stop") is False
+              and b16.get("pending_verification") is True, body16)
+
+        # 其他健康节点继续接流：node2 已排空，故先恢复 node2
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node2")["eligible"]:
+            time.sleep(0.2)
+        check("node2 恢复后可接流", node_status("node2")["eligible"] is True)
+        seen16 = set()
+        for _ in range(2):
+            status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+            check("其他节点接流成功", status == 200, str(body))
+            seen16.add(body["node"])
+        check("流量全部落在健康且未排空的 node2", seen16 == {"node2"}, str(seen16))
+
+        # 上游慢请求结束后再次排空：应确认完成并给回执
+        deadline = time.time() + 15
+        confirmed = None
+        while time.time() < deadline:
+            status, _, body16 = http(
+                "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=3"
+            )
+            confirmed = (status, json.loads(body16))
+            if status == 200:
+                break
+            time.sleep(0.3)
+        status, b16 = confirmed
+        check("上游执行结束后排空返回 200", status == 200, str(b16))
+        check("回执确认可停机",
+              b16.get("drained") is True and b16.get("safe_to_stop") is True
+              and b16.get("unconfirmed") == 0, str(b16))
+        check("确认信息包含待核明细", isinstance(b16.get("unconfirmed_requests"), list), str(b16))
+
+        # 17. 待核期间上游不可达 -> 维持待核；恢复后继续确认
+        print("== 17. 上游不可达维持待核，恢复后可继续确认 ==")
+        # 恢复 node1 接流，制造一个新的待核请求后立即让上游“不可达”
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.2)
+        # 排空 node2，确保请求进入 node1
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+
+        result17 = {}
+
+        def slow_call17():
+            result17["status"], _, result17["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=5", timeout=15
+            )
+
+        t17 = threading.Thread(target=slow_call17)
+        t17.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.1)
+        t17.join(timeout=15)
+        check("新一轮读超时请求进入待核",
+              node_status("node1")["unconfirmed"] == 1, str(node_status("node1")))
+
+        # 只让核对接口故障：健康探测与业务接口仍正常 -> 验证“探测转好不能抹去待核”
+        status, _, _ = http("POST", f"http://127.0.0.1:{U1_PORT}/control/verify_fail?enabled=true")
+        assert status == 200
+        status, _, body17 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=1"
+        )
+        b17 = json.loads(body17)
+        check("核对接口不可达时排空返回 202", status == 202, body17)
+        check("上游不可达不抹去待核",
+              b17.get("unconfirmed") == 1 and b17.get("last_verify_ok") is False, body17)
+        check("不可达时仍不给停机回执", b17.get("safe_to_stop") is False, body17)
+        st = node_status("node1")
+        check("周期探测仍成功但待核仍在",
+              st["healthy"] is True and st["unconfirmed"] == 1, str(st))
+
+        # 上游核对恢复（慢请求此时已执行结束）-> 再次排空应确认完成
+        http("POST", f"http://127.0.0.1:{U1_PORT}/control/verify_fail?enabled=false")
+        status, _, body17 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5"
+        )
+        b17 = json.loads(body17)
+        check("上游恢复后可继续确认并给回执",
+              status == 200 and b17.get("drained") is True
+              and b17.get("unconfirmed") == 0, body17)
+        check("状态中待核已清零", node_status("node1")["unconfirmed"] == 0)
+
+        # 18. 上游重启：旧请求随旧实例消失，超过观察窗口后由“上游从未登记”确认
+        print("== 18. 上游重启后旧请求经观察窗口确认 ==")
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.2)
+        result18 = {}
+
+        def slow_call18():
+            result18["status"], _, result18["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=30", timeout=15
+            )
+
+        t18 = threading.Thread(target=slow_call18)
+        t18.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.1)
+        t18.join(timeout=15)
+        check("超时请求再次进入待核",
+              node_status("node1")["unconfirmed"] == 1, str(node_status("node1")))
+        status, _, body18 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=1"
+        )
+        b18 = json.loads(body18)
+        check("重启前待核请求阻止回执",
+              status == 202 and b18.get("safe_to_stop") is False, body18)
+        # 重启 node1 上游：旧实例上的 30s 慢请求随之消失
+        kill(u1)
+        procs.remove(u1)
+        u1 = spawn(os.path.join(ROOT, "upstream"), U1_PORT, {"NODE_ID": "node1"})
+        procs.insert(0, u1)
+        assert wait_ready(f"http://127.0.0.1:{U1_PORT}/"), "上游 node1 重启失败"
+        status, _, body18 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5"
+        )
+        b18 = json.loads(body18)
+        check("重启后旧请求不再执行，待核得到确认，可停机",
+              status == 200 and b18.get("drained") is True
+              and b18.get("unconfirmed") == 0, b18)
+
+        # 19. 客户端中途断开：网关取消转发，但上游可能仍在执行 -> 进入待核
+        print("== 19. 客户端断开进入待核 ==")
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.2)
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        # 用 1.2s 客户端超时请求 8s 慢接口：网关已把请求交给上游，客户端先放弃。
+        # 网关自身在该场景下可能先到 1s 请求超时（返回 504），客户端是否读到
+        # 响应不影响结论：关键是不能虚报成功，且请求必须进入待核。
+        try:
+            status, _, body19 = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=8", timeout=1.2
+            )
+        except Exception:
+            status = 0
+        check("客户端放弃时未虚报成功", status in (0, 504), str(status))
+        deadline = time.time() + 6
+        while time.time() < deadline and node_status("node1")["unconfirmed"] != 1:
+            time.sleep(0.2)
+        st = node_status("node1")
+        check("客户端断开后网关在途归零", st["inflight"] == 0, str(st))
+        check("客户端断开请求进入待核", st["unconfirmed"] == 1, str(st))
+        check("客户端断开时不得给停机回执", st["safe_to_stop"] is False, str(st))
+        status, _, body19 = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=1"
+        )
+        b19 = json.loads(body19)
+        check("客户端断开后立即排空只返回未确认",
+              status == 202 and b19.get("drained") is False, body19)
+        # 上游慢请求结束后可确认
+        deadline = time.time() + 20
+        confirmed19 = None
+        while time.time() < deadline:
+            status, _, body19 = http(
+                "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=10"
+            )
+            confirmed19 = (status, json.loads(body19))
+            if status == 200:
+                break
+            time.sleep(0.5)
+        check("上游执行结束后客户端断开请求也得到确认",
+              confirmed19[0] == 200 and confirmed19[1].get("safe_to_stop") is True,
+              str(confirmed19[1]))
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0
